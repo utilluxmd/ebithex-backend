@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <!-- ── Masquage PII — actif sur TOUS les profils ────────────────────── -->
+    <!--
+        PiiMaskingConverter remplace les numéros de téléphone E.164 (+XXXXXXXXX)
+        et les adresses email par ***PHONE*** / ***EMAIL*** dans tous les messages.
+        Ceci prévient la fuite de données personnelles dans les logs (RGPD art. 32).
+    -->
+    <conversionRule conversionWord="maskedMsg"
+                    converterClass="com.ebithex.logging.PiiMaskingConverter"/>
+
+    <!-- ── Propriétés communes ──────────────────────────────────────────── -->
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="ebithex"/>
+
+    <!-- ── Profils local / dev : console lisible et colorée ─────────────── -->
+    <springProfile name="local,dev">
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>
+                    %d{HH:mm:ss.SSS} %highlight(%-5level) [%cyan(%X{correlationId:--})] [%yellow(%X{merchantId:--})] %magenta(%logger{36}) - %maskedMsg%n
+                </pattern>
+            </encoder>
+        </appender>
+
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+        <logger name="com.ebithex" level="DEBUG"/>
+        <logger name="org.springframework.security" level="WARN"/>
+        <logger name="org.hibernate.SQL" level="DEBUG"/>
+    </springProfile>
+
+    <!-- ── Profil prod : JSON structuré (ELK, Datadog, Loki…) ───────────── -->
+    <springProfile name="prod">
+        <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <!--
+                LogstashEncoder produit un JSON standard avec tous les champs MDC
+                comme top-level keys (correlationId, merchantId, etc.).
+                Compatible Elasticsearch/Logstash/Datadog/Loki out-of-the-box.
+            -->
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <!-- Champs statiques -->
+                <customFields>{"app":"${APP_NAME}","env":"prod"}</customFields>
+                <!-- Inclure les champs MDC comme top-level keys JSON -->
+                <includeMdcKeyName>correlationId</includeMdcKeyName>
+                <includeMdcKeyName>merchantId</includeMdcKeyName>
+                <!-- Masquage PII : le message formatté passe par PiiMaskingConverter -->
+                <messageJsonProvider class="net.logstash.logback.composite.loggingevent.MessageJsonProvider">
+                    <messageConverter>
+                        <conversionPattern>%maskedMsg</conversionPattern>
+                    </messageConverter>
+                </messageJsonProvider>
+                <!-- Renommer les champs standard pour compatibilité Datadog/ELK -->
+                <fieldNames>
+                    <timestamp>ts</timestamp>
+                    <message>msg</message>
+                    <logger>logger</logger>
+                    <thread>thread</thread>
+                    <levelValue>[ignore]</levelValue>
+                </fieldNames>
+                <!-- Ne pas inclure les données de stack trace dans le JSON par défaut -->
+                <throwableConverter class="net.logstash.logback.stacktrace.ShortenedThrowableConverter">
+                    <maxDepthPerCause>10</maxDepthPerCause>
+                    <shortenedClassNameLength>20</shortenedClassNameLength>
+                    <rootCauseFirst>true</rootCauseFirst>
+                </throwableConverter>
+            </encoder>
+        </appender>
+
+        <root level="WARN">
+            <appender-ref ref="JSON_CONSOLE"/>
+        </root>
+        <logger name="com.ebithex" level="INFO"/>
+        <!-- Réduire le bruit Spring en prod -->
+        <logger name="org.springframework" level="WARN"/>
+        <logger name="org.hibernate" level="WARN"/>
+    </springProfile>
+
+    <!-- ── Profil dev (distant) : JSON pour le monitoring dev ────────────── -->
+    <springProfile name="dev">
+        <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <customFields>{"app":"${APP_NAME}","env":"dev"}</customFields>
+                <includeMdcKeyName>correlationId</includeMdcKeyName>
+                <includeMdcKeyName>merchantId</includeMdcKeyName>
+            </encoder>
+        </appender>
+
+        <root level="INFO">
+            <appender-ref ref="JSON_CONSOLE"/>
+        </root>
+        <logger name="com.ebithex" level="DEBUG"/>
+    </springProfile>
+
+</configuration>

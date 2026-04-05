@@ -1,0 +1,176 @@
+---
+# Ebithex — Prometheus Alerting Rules
+# Fichier à déployer sur votre serveur Prometheus.
+# Lien avec Grafana : les alertes s'affichent dans le dashboard "Ebithex Operations".
+
+groups:
+  # ── SLO Availability ──────────────────────────────────────────────────────
+  - name: ebithex.slo.availability
+    rules:
+      - alert: EbithexHighErrorRate
+        expr: |
+          rate(ebithex_payments_failed_total[5m])
+          / (rate(ebithex_payments_initiated_total[5m]) + 0.0001)
+          > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          team: payment
+        annotations:
+          summary: "Taux d'erreur paiements > 5% ({{ $labels.operator }})"
+          description: >
+            Le taux d'erreur de l'opérateur {{ $labels.operator }} est de
+            {{ $value | humanizePercentage }} sur les 5 dernières minutes.
+            SLO cible : < 1%.
+
+      - alert: EbithexAPILatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            rate(ebithex_operator_call_duration_seconds_bucket[5m])
+          ) > 10
+        for: 2m
+        labels:
+          severity: warning
+          team: payment
+        annotations:
+          summary: "Latence P99 opérateur > 10s ({{ $labels.operator }})"
+          description: >
+            La latence P99 vers l'opérateur {{ $labels.operator }} est de
+            {{ $value }}s. SLO cible : P99 < 5s.
+
+  # ── SLO Throughput ────────────────────────────────────────────────────────
+  - name: ebithex.slo.throughput
+    rules:
+      - alert: EbithexPaymentVolumeDrop
+        expr: |
+          rate(ebithex_payments_initiated_total[15m])
+          < 0.1
+        for: 10m
+        labels:
+          severity: warning
+          team: payment
+        annotations:
+          summary: "Volume de paiements anormalement bas"
+          description: >
+            Moins de 0.1 transaction/seconde sur 15 minutes.
+            Possible incident réseau ou panne opérateur.
+
+  # ── Opérateurs ────────────────────────────────────────────────────────────
+  - name: ebithex.operators
+    rules:
+      - alert: EbithexOperatorDown
+        expr: |
+          absent(ebithex_payments_initiated_total{operator=~".+"})
+          or
+          rate(ebithex_payments_failed_total[10m])
+          / (rate(ebithex_payments_initiated_total[10m]) + 0.0001)
+          > 0.50
+        for: 5m
+        labels:
+          severity: critical
+          team: payment
+        annotations:
+          summary: "Opérateur {{ $labels.operator }} potentiellement indisponible"
+          description: >
+            > 50% des transactions en échec pour {{ $labels.operator }}.
+            Vérifier le statut de l'API opérateur et les logs Ebithex.
+
+      - alert: EbithexFloatLow
+        expr: |
+          ebithex_operator_float_balance < 100000
+        for: 1m
+        labels:
+          severity: critical
+          team: finance
+        annotations:
+          summary: "Float opérateur critique ({{ $labels.operator }})"
+          description: >
+            Le float de l'opérateur {{ $labels.operator }} est de
+            {{ $value | humanize }} XOF. Recharge immédiate requise.
+
+  # ── AML ───────────────────────────────────────────────────────────────────
+  - name: ebithex.aml
+    rules:
+      - alert: EbithexAmlCriticalAlert
+        expr: |
+          increase(ebithex_aml_alerts_created_total{severity="CRITICAL"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: compliance
+        annotations:
+          summary: "Alerte AML CRITIQUE détectée"
+          description: >
+            Une transaction a déclenché une règle AML de niveau CRITICAL
+            (règle: {{ $labels.rule }}). Revue immédiate requise.
+
+      - alert: EbithexAmlHighAlertBurst
+        expr: |
+          increase(ebithex_aml_alerts_created_total{severity="HIGH"}[1h]) > 20
+        for: 1m
+        labels:
+          severity: warning
+          team: compliance
+        annotations:
+          summary: "Burst d'alertes AML HIGH ({{ $value }} en 1h)"
+          description: >
+            {{ $value }} alertes AML HIGH créées en 1 heure.
+            Possible attaque ou client à risque. Revue en cours.
+
+  # ── Litiges ───────────────────────────────────────────────────────────────
+  - name: ebithex.disputes
+    rules:
+      - alert: EbithexDisputeBacklog
+        expr: |
+          increase(ebithex_disputes_opened_total[24h]) > 50
+        for: 5m
+        labels:
+          severity: warning
+          team: support
+        annotations:
+          summary: "Augmentation des litiges ({{ $value }} en 24h)"
+          description: >
+            {{ $value }} litiges ouverts en 24 heures.
+            Vérifier la qualité des paiements et contacter le support.
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+  - name: ebithex.infrastructure
+    rules:
+      - alert: EbithexJvmMemoryHigh
+        expr: |
+          jvm_memory_used_bytes{area="heap"}
+          / jvm_memory_max_bytes{area="heap"}
+          > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "Mémoire JVM heap > 85%"
+          description: "Heap utilisé: {{ $value | humanizePercentage }}. Risque d'OOM."
+
+      - alert: EbithexDatabaseConnectionsHigh
+        expr: |
+          hikaricp_connections_active / hikaricp_connections_max > 0.80
+        for: 3m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "Pool connexions DB > 80%"
+          description: >
+            {{ $value | humanizePercentage }} des connexions HikariCP sont actives.
+            Risque de saturation si la charge augmente.
+
+      - alert: EbithexOutboxPending
+        expr: |
+          ebithex_outbox_pending_count > 1000
+        for: 5m
+        labels:
+          severity: warning
+          team: payment
+        annotations:
+          summary: "Outbox events en attente ({{ $value }})"
+          description: >
+            {{ $value }} événements en attente dans l'outbox.
+            Vérifier que le poller fonctionne correctement.

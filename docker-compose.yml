@@ -1,0 +1,138 @@
+version: '3.8'
+
+# Infrastructure locale pour le développement.
+#
+# Mode développement (app sur la machine hôte) :
+#   docker compose up -d postgres redis
+#   mvn spring-boot:run -pl module-app -Dspring-boot.run.profiles=local
+#
+# Mode développement + interfaces DB/Redis :
+#   docker compose --profile tools up -d
+#   → pgAdmin  : http://localhost:5050  (admin@ebithex.com / admin)
+#   → Redis UI : http://localhost:5540
+#
+# Mode full-stack (tout conteneurisé) :
+#   docker compose --profile full up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ebithex
+      POSTGRES_USER: ebithex
+      POSTGRES_PASSWORD: ebithex_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ebithex"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── pgAdmin (profil tools) ────────────────────────────────────────────────
+  pgadmin:
+    profiles: ["tools"]
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@ebithex.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmindata:/var/lib/pgadmin
+    depends_on:
+      - postgres
+
+  # ── Redis Insight (profil tools) ─────────────────────────────────────────
+  redis-insight:
+    profiles: ["tools"]
+    image: redis/redisinsight:latest
+    ports:
+      - "5540:5540"
+    volumes:
+      - redisinsightdata:/data
+    depends_on:
+      - redis
+
+  # ── Application (mode full-stack) ───────────────────────────────────────────
+  # Activé uniquement avec : docker compose --profile full up -d
+  app:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ebithex-backend:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ebithex
+      SPRING_DATASOURCE_USERNAME: ebithex
+      SPRING_DATASOURCE_PASSWORD: ebithex_secret
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      # ⚠️ Ces variables DOIVENT être définies dans un fichier .env (non commité).
+      # Copier .env.example → .env et renseigner chaque valeur.
+      # L'absence de valeur fait échouer le démarrage avec un message explicite.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY manquant — voir .env.example (openssl rand -base64 32)}
+      JWT_SECRETS: ${JWT_SECRETS:?JWT_SECRETS manquant — voir .env.example (openssl rand -base64 48)}
+      EBITHEX_SUPER_ADMIN_EMAIL: ${EBITHEX_SUPER_ADMIN_EMAIL:-}
+      EBITHEX_SUPER_ADMIN_PASSWORD: ${EBITHEX_SUPER_ADMIN_PASSWORD:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/actuator/health | grep -q '\"status\":\"UP\"' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Prometheus (optionnel, profil observability) ──────────────────────────
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:latest
+    volumes:
+      - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  # ── Grafana (optionnel, profil observability) ─────────────────────────────
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./module-app/src/main/resources/grafana:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:
+  redisdata:
+  grafanadata:
+  pgadmindata:
+  redisinsightdata:

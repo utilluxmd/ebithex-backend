@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.4.3</version>
+    </parent>
+
+    <groupId>com.ebithex</groupId>
+    <artifactId>ebithex-backend</artifactId>
+    <version>1.0.0</version>
+    <packaging>pom</packaging>
+    <name>Ebithex Backend</name>
+    <description>Agregateur de paiement Mobile Money - Afrique de l Ouest</description>
+
+    <properties>
+        <java.version>21</java.version>
+        <jacoco.version>0.8.12</jacoco.version>
+        <jjwt.version>0.12.6</jjwt.version>
+        <mapstruct.version>1.6.3</mapstruct.version>
+        <springdoc.version>2.8.3</springdoc.version>
+        <libphonenumber.version>8.13.52</libphonenumber.version>
+        <resilience4j.version>2.3.0</resilience4j.version>
+        <awssdk.version>2.29.50</awssdk.version>
+        <tika.version>2.9.2</tika.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.github.resilience4j</groupId>
+                <artifactId>resilience4j-spring-boot3</artifactId>
+                <version>${resilience4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>1.20.6</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- AWS SDK v2 BOM -->
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${awssdk.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <modules>
+        <module>module-shared</module>
+        <module>module-merchant</module>
+        <module>module-auth</module>
+        <module>module-operator</module>
+        <module>module-payment</module>
+        <module>module-webhook</module>
+        <module>module-wallet</module>
+        <module>module-notification</module>
+        <module>module-app</module>
+    </modules>
+
+    <!-- Dépendances communes à tous les modules -->
+    <dependencies>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <!--
+                    JaCoCo : couverture de code pour tous les modules.
+                    ${jacoco.version} est fourni par spring-boot-starter-parent (0.8.12+).
+                    Rapport par module : target/site/jacoco/index.html
+                    Rapport agrégé    : module-app/target/site/jacoco-aggregate/index.html
+                -->
+                <plugin>
+                    <groupId>org.jacoco</groupId>
+                    <artifactId>jacoco-maven-plugin</artifactId>
+                    <version>${jacoco.version}</version>
+                </plugin>
+
+                <!--
+                    Maven Surefire - configuration commune a tous les modules.
+                    Les flags add-opens sont requis par Mockito/ByteBuddy sur Java 21
+                    pour instrumenter les classes lors des tests avec inline mocks.
+                    @{argLine} est le placeholder late-binding de JaCoCo : il injecte
+                    l'agent javaagent:jacoco.jar APRES l'evaluation initiale des proprietes.
+                -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <configuration>
+                        <argLine>
+                            @{argLine}
+                            -XX:+EnableDynamicAgentLoading
+                            --add-opens java.base/java.lang=ALL-UNNAMED
+                            --add-opens java.base/java.lang.reflect=ALL-UNNAMED
+                            --add-opens java.base/java.util=ALL-UNNAMED
+                        </argLine>
+                    </configuration>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <configuration>
+                        <excludes>
+                            <exclude>
+                                <groupId>org.projectlombok</groupId>
+                                <artifactId>lombok</artifactId>
+                            </exclude>
+                        </excludes>
+                    </configuration>
+                </plugin>
+
+                <!--
+                    OWASP Dependency-Check : scan CVE automatique sur toutes les dépendances.
+                    Échoue le build si une CVE de score ≥ 7 (HIGH) est détectée.
+                    Exécution : mvn verify -P owasp  ou  mvn dependency-check:check
+                    Rapport : target/dependency-check-report.html
+                -->
+                <plugin>
+                    <groupId>org.owasp</groupId>
+                    <artifactId>dependency-check-maven</artifactId>
+                    <version>10.0.4</version>
+                    <configuration>
+                        <failBuildOnCVSS>7</failBuildOnCVSS>
+                        <suppressionFile>${project.basedir}/owasp-suppressions.xml</suppressionFile>
+                        <formats>
+                            <format>HTML</format>
+                            <format>JSON</format>
+                        </formats>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+
+        <plugins>
+            <!--
+                Profil owasp : mvn verify -P owasp
+                Le scan CVE est exclu du cycle par défaut (coût réseau) ;
+                il est exécuté explicitement en CI via ce profil.
+            -->
+
+            <!--
+                JaCoCo — instrumenté pour tous les modules via ce POM parent.
+                - prepare-agent  : injecte l'agent JVM avant les tests (phase test)
+                - report         : génère le rapport HTML par module (phase verify)
+                Rapport agrégé multi-modules → module-app/pom.xml (report-aggregate)
+            -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>jacoco-prepare-agent</id>
+                        <goals><goal>prepare-agent</goal></goals>
+                    </execution>
+                    <execution>
+                        <id>jacoco-report</id>
+                        <phase>verify</phase>
+                        <goals><goal>report</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <id>owasp</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.owasp</groupId>
+                        <artifactId>dependency-check-maven</artifactId>
+                        <executions>
+                            <execution>
+                                <goals><goal>aggregate</goal></goals>
+                                <phase>verify</phase>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

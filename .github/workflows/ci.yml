@@ -1,0 +1,345 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, 'feature/**', 'fix/**' ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  JAVA_VERSION: '21'
+
+jobs:
+  # ── Job 1 : Tests + Coverage + Security ────────────────────────────────────
+  test:
+    name: Tests & Quality Gates
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ebithex_test
+          POSTGRES_USER: ebithex
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa9c2b15d4bc90f0b73  # v4.7.0
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Run unit & integration tests
+        env:
+          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/ebithex_test
+          SPRING_DATASOURCE_USERNAME: ebithex
+          SPRING_DATASOURCE_PASSWORD: test_password
+          SPRING_DATA_REDIS_HOST: localhost
+          SPRING_DATA_REDIS_PORT: 6379
+          # Base64(32 bytes) — clé de test uniquement, jamais utilisée en production
+          ENCRYPTION_KEY: dGVzdC1lbmNyeXB0aW9uLWtleS0zMmJ5dGVzISE=
+          # Pluriel : correspond à ebithex.security.jwt.secrets (multi-clés rotation)
+          JWT_SECRETS: test-jwt-secret-key-that-is-long-enough-for-hs256
+        run: mvn verify -B -q
+
+      - name: Check test coverage (minimum 80%)
+        run: |
+          mvn jacoco:check -B -q \
+            -Djacoco.minimum.coverage=0.80 \
+            || (echo "Coverage below 80% — failing build" && exit 1)
+
+      - name: Publish test results
+        uses: dorny/test-reporter@31a54ee7ebcacc03a09ea97a7e5465a47b84aea5  # v1.9.1
+        if: always()
+        with:
+          name: JUnit Tests
+          path: '**/target/surefire-reports/TEST-*.xml'
+          reporter: java-junit
+
+      - name: Upload Jacoco coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: jacoco-report
+          # Rapport agrégé multi-modules (tous les modules, pas seulement module-app)
+          path: module-app/target/site/jacoco-aggregate/
+
+      - name: OWASP Dependency Check
+        # Sur main : bloquant si CVE ≥ 7 (HIGH/CRITICAL) détectée.
+        # Sur les autres branches : non-bloquant (rapport uploadé pour revue).
+        run: |
+          mvn org.owasp:dependency-check-maven:check \
+            -DfailBuildOnCVSS=7 \
+            -DsuppressionFile=.owasp-suppressions.xml \
+            -B -q
+        continue-on-error: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Upload OWASP report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: owasp-dependency-check-report
+          path: '**/target/dependency-check-report.html'
+
+  # ── Job 2 : Docker Build + Trivy Scan ──────────────────────────────────────
+  docker-build:
+    name: Docker Build & Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3.10.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@902fa8ec7d6ecbea8a63c5d6a5d7cb95cec50ece  # v5.7.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build Docker image (no push yet — scan first)
+        id: build
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1  # v6.16.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        # Pinné sur SHA — évite les supply chain attacks via tag mutable @master.
+        # SHA correspond à aquasecurity/trivy-action v0.29.0 (janvier 2026).
+        # À mettre à jour lors des montées de version planifiées.
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0  # v0.29.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+        # Sur main : bloquant (CRITICAL/HIGH interdits en production).
+        # Sur feature branches : non-bloquant mais rapport uploadé.
+        continue-on-error: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Upload Trivy SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push Docker image
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1  # v6.16.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Job 3 : Deploy to Staging (develop branch) ─────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+
+    steps:
+      - name: Deploy to staging (pre-warm + minimal downtime)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            set -e
+            IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:develop"
+            docker pull "$IMAGE"
+
+            # 1. Démarrer le nouveau conteneur sur port 8081 pour le pré-chauffage.
+            #    Le contexte Spring, les pools HikariCP et Flyway sont initialisés
+            #    avant de couper le trafic vers l'ancien conteneur.
+            docker stop ebithex-staging-next 2>/dev/null || true
+            docker rm   ebithex-staging-next 2>/dev/null || true
+            docker run -d \
+              --name ebithex-staging-next \
+              --restart no \
+              -p 8081:8080 \
+              --env-file /opt/ebithex/staging.env \
+              "$IMAGE"
+
+            # 2. Attendre que le nouveau conteneur soit healthy (max 2m30s).
+            echo "Attente du démarrage du nouveau conteneur..."
+            HEALTHY=false
+            for i in $(seq 1 30); do
+              if curl -sf http://localhost:8081/api/actuator/health 2>/dev/null | grep -q '"status":"UP"'; then
+                HEALTHY=true
+                echo "Conteneur sain après $((i * 5))s"
+                break
+              fi
+              echo "  tentative $i/30..."
+              sleep 5
+            done
+
+            if [ "$HEALTHY" != "true" ]; then
+              echo "ERREUR : le nouveau conteneur n'a pas démarré — rollback"
+              docker rm -f ebithex-staging-next || true
+              exit 1
+            fi
+
+            # 3. Basculement minimal : arrêt ancien, redémarrage nouveau sur port 8080.
+            #    Downtime réduit à ~2-3 secondes (context JVM déjà chaud).
+            docker stop ebithex-staging 2>/dev/null || true
+            docker rm   ebithex-staging 2>/dev/null || true
+            docker stop ebithex-staging-next
+            docker rm   ebithex-staging-next
+            docker run -d \
+              --name ebithex-staging \
+              --restart unless-stopped \
+              -p 8080:8080 \
+              --env-file /opt/ebithex/staging.env \
+              "$IMAGE"
+
+            docker image prune -f
+
+      - name: Smoke test staging
+        run: |
+          # Retry loop — plus robuste qu'un sleep fixe
+          echo "Vérification santé staging..."
+          for i in $(seq 1 12); do
+            if curl -sf "${{ vars.STAGING_URL }}/api/actuator/health" | grep -q '"status":"UP"'; then
+              echo "Staging opérationnel"
+              exit 0
+            fi
+            echo "  tentative $i/12..."
+            sleep 5
+          done
+          echo "ERREUR : staging non disponible après 60s"
+          exit 1
+
+  # ── Job 4 : Deploy to Production (main branch, manual approval) ────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+
+    steps:
+      - name: Deploy to production (pre-warm + minimal downtime)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            set -e
+            IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+            docker pull "$IMAGE"
+
+            # 1. Pré-chauffage sur port 8081.
+            #    Le contexte Spring, les migrations Flyway et les pools de connexions
+            #    sont entièrement initialisés AVANT de couper le trafic production.
+            docker stop ebithex-prod-next 2>/dev/null || true
+            docker rm   ebithex-prod-next 2>/dev/null || true
+            docker run -d \
+              --name ebithex-prod-next \
+              --restart no \
+              -p 8081:8080 \
+              --env-file /opt/ebithex/prod.env \
+              "$IMAGE"
+
+            # 2. Health check du nouveau conteneur (max 5 minutes).
+            echo "Attente du démarrage du nouveau conteneur production..."
+            HEALTHY=false
+            for i in $(seq 1 60); do
+              if curl -sf http://localhost:8081/api/actuator/health 2>/dev/null | grep -q '"status":"UP"'; then
+                HEALTHY=true
+                echo "Conteneur sain après $((i * 5))s"
+                break
+              fi
+              echo "  tentative $i/60..."
+              sleep 5
+            done
+
+            if [ "$HEALTHY" != "true" ]; then
+              echo "ERREUR CRITIQUE : nouveau conteneur non opérationnel — rollback, production inchangée"
+              docker rm -f ebithex-prod-next || true
+              exit 1
+            fi
+
+            # 3. Basculement : l'ancien conteneur s'arrête proprement (graceful shutdown),
+            #    le nouveau redémarre sur le port 8080 (context JVM déjà chaud → ~2s de downtime).
+            docker stop --time 30 ebithex-prod 2>/dev/null || true
+            docker rm   ebithex-prod 2>/dev/null || true
+            docker stop ebithex-prod-next
+            docker rm   ebithex-prod-next
+            docker run -d \
+              --name ebithex-prod \
+              --restart unless-stopped \
+              -p 8080:8080 \
+              --env-file /opt/ebithex/prod.env \
+              "$IMAGE"
+
+            docker image prune -f
+
+      - name: Verify production health
+        run: |
+          echo "Vérification santé production..."
+          for i in $(seq 1 24); do
+            if curl -sf "${{ vars.PRODUCTION_URL }}/api/actuator/health" | grep -q '"status":"UP"'; then
+              echo "Production opérationnelle"
+              exit 0
+            fi
+            echo "  tentative $i/24..."
+            sleep 5
+          done
+          echo "ERREUR : production non disponible après 120s — intervention manuelle requise"
+          exit 1
